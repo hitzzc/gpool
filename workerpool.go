@@ -1,27 +1,41 @@
 package gpool
 
 import (
-	"log"
+	"errors"
 	"sync"
 	"time"
 )
 
+const (
+	MaxJobNum int = 100 * 100
+)
+
+var (
+	// need have a more suitable error name
+	ErrMaxWorkerNum = errors.New("worker number excess max")
+	ErrStopped      = errors.New("WorkerPool has been stopped")
+)
+
 // WorkerPool define a worker pool
 type WorkerPool struct {
-	maxWorkerNumber int           //the max worker number in the pool
-	workerNumber    int           //the worker number now in the pool
-	workers         []*Worker     //the available worker queue
-	lock            sync.Mutex    //for queue thread-safe
-	maxIdleTime     time.Duration //the recycle time. That means goroutine will be destroyed when it has not been used for maxIdleTime.
-	stop            chan struct{} //stop
-	stopFlag        bool          //trick
-	objectPool      *sync.Pool    //gc-friendly
+	sync.WaitGroup //for worker sync
+
+	maxWorkerNumber     int           //the max worker number in the pool
+	currentWorkerNumber int           //the worker number now in the pool
+	maxIdleTime         time.Duration //the recycle time. That means goroutine will be destroyed when it has not been used for maxIdleTime.
+	limited             bool          // unlimited or limited number worker pool
+
+	jobQueue     chan *job
+	pendingQueue chan chan func()
+	stop         chan struct{} //stop
+
+	objectPool *sync.Pool //gc-friendly
 }
 
-//Worker run as a goroutine
-type Worker struct {
-	fn           chan func()
-	lastUsedTime int64
+type job struct {
+	fn       func()
+	callback chan error
+	syncFlag bool
 }
 
 // NewLimt creates a worker pool
@@ -34,15 +48,11 @@ func NewLimit(maxWorkerNum, recycleTime int) (*WorkerPool, error) {
 	wp := &WorkerPool{
 		maxWorkerNumber: maxWorkerNum,
 		maxIdleTime:     time.Duration(recycleTime) * time.Minute,
-		objectPool: &sync.Pool{
-			New: func() interface{} {
-				return &Worker{
-					fn: make(chan func()),
-				}
-			},
-		},
+		jobQueue:        make(chan *job, MaxJobNum),
+		pendingQueue:    make(chan chan func(), maxWorkerNum),
+		limited:         true,
 	}
-	wp.init()
+	go wp.supervisor()
 	return wp, nil
 }
 
@@ -51,116 +61,117 @@ func NewUnlimit(recycleTime int) (*WorkerPool, error) {
 	wp := &WorkerPool{
 		maxWorkerNumber: -1,
 		maxIdleTime:     time.Duration(recycleTime) * time.Minute,
+		jobQueue:        make(chan *job, MaxJobNum),
 	}
 
-	wp.init()
+	go wp.supervisor()
 	return wp, nil
 }
 
 // init initializes the workerpool.
 //
 // init func will be in charge of cleaning up goroutines and receiving the stop signal.
-func (wp *WorkerPool) init() {
-	go func() {
-		tick := time.Tick(wp.maxIdleTime)
-		for {
-			select {
-			case <-tick:
-				wp.cleanup()
-			case <-wp.stop:
-				wp.stopPool()
-				break
+func (wp *WorkerPool) supervisor() {
+L:
+	for {
+		select {
+		case <-wp.stop:
+			wp.Wait()
+			break L
+		case j := <-wp.jobQueue:
+			if !wp.limited {
+				go j.fn()
+				if j.syncFlag {
+					j.callback <- nil
+				}
+			} else {
+				wp.handleJob(j)
 			}
 		}
+	}
+}
+
+func (wp *WorkerPool) handleJob(j *job) {
+	var err error
+	defer func() {
+		if j.syncFlag {
+			j.callback <- err
+		}
 	}()
-}
-
-// Stop stop goroutine pool
-func (wp *WorkerPool) Stop() {
-	wp.stop <- struct{}{}
-}
-
-// cleanup cleans up the available worker queue.
-func (wp *WorkerPool) cleanup() {
-	i := 0
-	now := time.Now().Unix()
-	for i = 0; i < len(wp.workers); i++ {
-		if time.Duration(now-wp.workers[i].lastUsedTime)*time.Second < wp.maxIdleTime {
-			break
-		} else {
-			close(wp.workers[i].fn)
+	for {
+		select {
+		case <-wp.stop:
+			err = ErrStopped
+			return
+		case funcCh := <-wp.pendingQueue:
+			funcCh <- j.fn
+			return
+		default:
+			if wp.maxWorkerNumber != -1 && wp.currentWorkerNumber > wp.maxWorkerNumber {
+				err = ErrMaxWorkerNum
+				return
+			}
+			started := make(chan struct{}, 1)
+			wp.Add(1)
+			wp.currentWorkerNumber++
+			go wp.worker(started)
+			<-started
 		}
 	}
-
-	wp.lock.Lock()
-	wp.workers = wp.workers[i:]
-	wp.lock.Unlock()
 }
 
 // stopPool stops the worker pool.
-func (wp *WorkerPool) stopPool() {
-	wp.stopFlag = true
-
-	wp.lock.Lock()
-	for _, w := range wp.workers {
-		w.fn <- nil
-	}
-	wp.lock.Unlock()
+func (wp *WorkerPool) StopPool() {
+	close(wp.stop)
 }
 
 // Queue assigns a worker for job (fn func(), with closure we can define every job in this form)
 //
 // If the worker pool is limited-number and the worker number has reached the limit, we prefer to discard the job.
-func (wp *WorkerPool) Queue(fn func()) {
-	worker := wp.getWorker()
-	if worker == nil {
-		log.Print("get worker Failed")
-		return
+func (wp *WorkerPool) SyncQueue(fn func()) (err error) {
+	select {
+	case <-wp.stop:
+		return ErrStopped
+	default:
 	}
-	worker.fn <- fn
+	j := &job{fn: fn, callback: make(chan error, 1), syncFlag: true}
+	wp.jobQueue <- j
+	err = <-j.callback
+	return
 }
-
-// GetWorker select a worker.
-//
-// If the available worker queue is empty, we will new a worker.
-// else we will select the last worker, in this case, the worker queue
-// is like a FILO queue, and the select algorithm is kind of like LRU.
-func (wp *WorkerPool) getWorker() *Worker {
-	if len(wp.workers) == 0 {
-		wp.workerNumber++
-		if wp.maxWorkerNumber != -1 && wp.workerNumber > wp.maxWorkerNumber {
-			//log
-			log.Println("worker number excess max")
-			return nil
-		}
-		worker := &Worker{
-			fn: make(chan func()),
-		}
-		go wp.startWorker(worker)
-		return worker
+func (wp *WorkerPool) AsyncQueue(fn func()) {
+	select {
+	case <-wp.stop:
+		return
+	default:
 	}
-
-	wp.lock.Lock()
-	worker := wp.workers[len(wp.workers)-1]
-	wp.workers = wp.workers[:len(wp.workers)-1]
-	wp.lock.Unlock()
-	return worker
+	wp.jobQueue <- &job{fn: fn}
+	return
 }
 
 // StartWorker starts a new goroutine.
-func (wp *WorkerPool) startWorker(worker *Worker) {
-	for f := range worker.fn {
-		if f == nil {
-			break
+func (wp *WorkerPool) worker(started chan<- struct{}) {
+	first := true
+	defer wp.Done()
+	timer := time.NewTimer(wp.maxIdleTime)
+	funcCh := make(chan func(), 10)
+	for {
+		wp.pendingQueue <- funcCh
+		if first {
+			started <- struct{}{}
+			first = false
 		}
-		f()
-
-		if wp.stopFlag == true {
-			break
+		select {
+		case <-wp.stop:
+			return
+		case <-timer.C:
+			return
+		case f := <-funcCh:
+			if f == nil {
+				continue
+			}
+			f()
 		}
-		worker.lastUsedTime = time.Now().Unix()
-		wp.lock.Lock()
-		wp.workers = append(wp.workers, worker)
-		wp.lock.Unlock()
+		timer.Reset(wp.maxIdleTime)
 	}
 }

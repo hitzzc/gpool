@@ -2,7 +2,7 @@
 package main
 
 import (
-	////"../../gpool"
+	"../../gpool"
 	"log"
 	"net"
 	//"runtime"
@@ -15,7 +15,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	//wp, _ := gpool.NewLimit(10000, 5)
+	wp, _ := gpool.NewLimit(10000, 5)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -26,7 +26,7 @@ func main() {
 			conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nfoo"))
 			conn.Close()
 		}
-		//wp.SyncQueue(f)
-		go f()
+		wp.SyncQueue(f)
+		//go f()
 	}
 }

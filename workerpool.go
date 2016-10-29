@@ -154,7 +154,7 @@ func (wp *WorkerPool) worker(started chan<- struct{}) {
 	first := true
 	defer wp.Done()
 	timer := time.NewTimer(wp.maxIdleTime)
-	funcCh := make(chan func(), 10)
+	funcCh := make(chan func(), 1)
 	for {
 		wp.pendingQueue <- funcCh
 		if first {
